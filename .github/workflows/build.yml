@@ -1,0 +1,37 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Check the run-from-swap flags are set
+        shell: pwsh
+        run: |
+          $b  = [IO.File]::ReadAllBytes("target/release/PreventShutdownApp.exe")
+          $pe = [BitConverter]::ToInt32($b, 0x3C)
+          $ch = [BitConverter]::ToUInt16($b, $pe + 22)   # COFF Characteristics
+          if (($ch -band 0x400) -eq 0) { throw "IMAGE_FILE_REMOVABLE_RUN_FROM_SWAP missing" }
+          if (($ch -band 0x800) -eq 0) { throw "IMAGE_FILE_NET_RUN_FROM_SWAP missing" }
+          "Characteristics = 0x{0:X4} (run-from-swap OK)" -f $ch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PreventShutdownApp
+          path: target/release/PreventShutdownApp.exe
+      - name: Attach to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/PreventShutdownApp.exe
