@@ -14,10 +14,12 @@ use windows_sys::Win32::Media::Audio::{
     PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT, SND_SYNC,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    GetDriveTypeW, GetFileType, GetLogicalDrives, GetVolumeInformationW, FILE_TYPE_DISK,
+    FILE_TYPE_PIPE,
 };
 use windows_sys::Win32::System::Console::{
-    AttachConsole, FreeConsole, GetConsoleTitleW, SetConsoleCtrlHandler,
+    AttachConsole, FreeConsole, GetConsoleTitleW, GetStdHandle, SetConsoleCtrlHandler,
+    ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -159,6 +161,26 @@ pub fn message_box(title: &str, text: &str, error: bool) {
             MB_OK | MB_SETFOREGROUND | icon,
         )
     };
+}
+
+pub fn print_to_console(text: &str) -> bool {
+    use std::io::Write;
+    unsafe {
+        let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        if matches!(GetFileType(stdout), FILE_TYPE_DISK | FILE_TYPE_PIPE) {
+            return std::io::stdout().write_all(text.as_bytes()).is_ok();
+        }
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return false;
+        }
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("CONOUT$")
+        .and_then(|mut console| write!(console, "
+{}
+", text.trim_end()))
+        .is_ok()
 }
 
 pub fn prepare_process(host_override: Option<&str>) -> LaunchInfo {

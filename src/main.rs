@@ -33,7 +33,10 @@ fn main() {
         Ok(cli) => cli,
         Err(e) => {
             let is_error = e.use_stderr();
-            win::message_box("PreventShutdownApp", &e.to_string(), is_error);
+            let text = e.to_string();
+            if is_error || !win::print_to_console(&text) {
+                win::message_box("PreventShutdownApp", &text, is_error);
+            }
             std::process::exit(if is_error { 2 } else { 0 });
         }
     };
@@ -136,7 +139,11 @@ fn main() {
         Ok(Action::Stop) => {
             win::stop_all();
         }
-        Ok(Action::Info(text)) => win::message_box("PreventShutdownApp", &text, false),
+        Ok(Action::Info(text)) => {
+            if !win::print_to_console(&text) {
+                win::message_box("PreventShutdownApp", &text, false);
+            }
+        }
         Err(e) => {
             win::message_box("PreventShutdownApp", &e, true);
             std::process::exit(2);
