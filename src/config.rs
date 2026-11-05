@@ -81,10 +81,6 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub as_host: Option<String>,
 
-    /// DIAGNOSTIC: show the blocker window instead of keeping it hidden, in case this PC only lists visible windows on its shutdown screen
-    #[arg(long)]
-    pub show_window: bool,
-
     /// DIAGNOSTIC: wait this many milliseconds before answering Windows' shutdown request (max 60000), to test the unresponsive-app path instead of the veto path
     #[arg(long, value_name = "MS", default_value_t = 0)]
     pub stall: u32,
@@ -132,8 +128,6 @@ pub struct Config {
     pub observe_only: bool,
     /// Play an alert when a shutdown is attempted, if it could be heard.
     pub alert: bool,
-    /// Show the blocker window rather than keeping it hidden.
-    pub show_window: bool,
     /// Milliseconds to wait before answering a shutdown request.
     pub stall_ms: u32,
 }
@@ -235,7 +229,6 @@ fn unplug_usb_warning(args: &[String], launch: &LaunchInfo) -> Result<Config, St
         show_window_title: false,
         observe_only: false,
         alert: false,
-        show_window: false,
         stall_ms: 0,
         reminder: ReminderText {
             menu_label: "Remind me to unplug when computer locks".into(),
@@ -262,7 +255,6 @@ fn job_config(display: &str, condition: Condition) -> Config {
         show_window_title: true,
         observe_only: false,
         alert: false,
-        show_window: false,
         stall_ms: 0,
         reminder: ReminderText {
             menu_label: "Remind me when computer locks".into(),
@@ -333,7 +325,6 @@ fn take_charger(args: &[String], launch: &LaunchInfo) -> Result<Config, String> 
         show_window_title: false,
         observe_only: false,
         alert: false,
-        show_window: false,
         stall_ms: 0,
         reminder: ReminderText {
             menu_label: "Remind me to take the charger when computer locks".into(),
@@ -455,7 +446,6 @@ pub fn resolve(cli: Cli, launch: &LaunchInfo) -> Result<Action, String> {
                 show_window_title: false,
                 observe_only: false,
                 alert: false,
-                show_window: false,
                 stall_ms: 0,
                 reminder: ReminderText::default(),
             }
@@ -470,7 +460,6 @@ fn apply_overrides(config: &mut Config, cli: &Cli) -> Result<(), String> {
     config.lock_reminder = cli.lock_reminder;
     config.observe_only = cli.observe_only;
     config.alert = cli.alert;
-    config.show_window = cli.show_window;
     config.stall_ms = cli.stall;
     if cli.stall > 60_000 {
         return Err("--stall must be 60000 ms or less".into());

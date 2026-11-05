@@ -111,7 +111,6 @@ Only needed if the app doesn't seem to be blocking anything. See [When shutdown 
 | `--no-memory`     | Doesn't read or write that record at all.                                |
 | `--memory-file PATH` | Keeps the record somewhere other than next to the exe.               |
 | `--as-host NAME`  | Pretends the PC has this name, to see which remembered machines and prefixes it would match. Changes nothing on the PC. |
-| `--show-window`   | Shows the blocker window instead of keeping it hidden.                   |
 | `--stall MS`      | Waits this long before answering Windows, to test the unresponsive-app path rather than the veto path. Max 60000. |
 
 ---
