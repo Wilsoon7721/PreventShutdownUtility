@@ -177,9 +177,7 @@ pub fn print_to_console(text: &str) -> bool {
     std::fs::OpenOptions::new()
         .write(true)
         .open("CONOUT$")
-        .and_then(|mut console| write!(console, "
-{}
-", text.trim_end()))
+        .and_then(|mut console| write!(console, "\n{}\n", text.trim_end()))
         .is_ok()
 }
 
@@ -1062,7 +1060,7 @@ pub fn run(config: Config) -> Result<i32, String> {
             return Err("CreateWindowExW failed".into());
         }
 
-        if CONFIG.get().is_some_and(|c| c.show_window) || known_override() {
+        if known_override() {
             MoveWindow(hwnd, 80, 80, 480, 170, 0);
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
