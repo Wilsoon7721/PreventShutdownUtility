@@ -3,9 +3,16 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, BOOL, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT, WPARAM,
+    CloseHandle, GetLastError, BOOL, HWND, INVALID_HANDLE_VALUE, LPARAM, LRESULT, POINT,
+    SYSTEMTIME, WPARAM,
 };
-use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
+use windows_sys::Win32::Graphics::Gdi::{
+    BeginPaint, DrawTextW, EndPaint, FillRect, GetSysColorBrush, COLOR_WINDOW, DT_CENTER,
+    DT_WORDBREAK, PAINTSTRUCT,
+};
+use windows_sys::Win32::Media::Audio::{
+    PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT, SND_SYNC,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
 };
@@ -21,12 +28,13 @@ use windows_sys::Win32::System::Power::{
     GetSystemPowerStatus, PlatformRoleMobile, PlatformRoleSlate, PowerDeterminePlatformRoleEx,
     POWER_PLATFORM_ROLE_V2, SYSTEM_POWER_STATUS,
 };
+use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 use windows_sys::Win32::System::RemoteDesktop::{
     ProcessIdToSessionId, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
     NOTIFY_FOR_THIS_SESSION,
 };
 use windows_sys::Win32::System::Shutdown::{ShutdownBlockReasonCreate, ShutdownBlockReasonDestroy};
-use windows_sys::Win32::System::SystemInformation::{GetSystemFirmwareTable, RSMB};
+use windows_sys::Win32::System::SystemInformation::{GetLocalTime, GetSystemFirmwareTable, RSMB};
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, SetProcessShutdownParameters};
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -34,19 +42,20 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, EnumWindows, FindWindowExW, GetCursorPos, GetMessageW, GetWindow,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, KillTimer, LoadIconW, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-    SetTimer, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, GW_OWNER, IDI_INFORMATION,
-    IDI_WARNING, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
-    WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DEVICECHANGE, WM_ENDSESSION, WM_LBUTTONUP, WM_NULL,
-    WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW,
-    WS_OVERLAPPED,
+    DispatchMessageW, EnumWindows, FindWindowExW, GetClientRect, GetCursorPos, GetMessageW,
+    GetWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, KillTimer, LoadIconW,
+    MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+    SetForegroundWindow, SetTimer, ShowWindow, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT,
+    GW_OWNER, IDI_INFORMATION, IDI_WARNING, MB_ICONERROR, MB_ICONINFORMATION, MB_OK,
+    MB_SETFOREGROUND, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SW_SHOWNOACTIVATE,
+    TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
+    WM_DEVICECHANGE, WM_ENDSESSION, WM_LBUTTONUP, WM_NULL, WM_PAINT, WM_POWERBROADCAST,
+    WM_QUERYENDSESSION, WM_RBUTTONUP, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::config::{compose_reason, Condition, Config, LaunchInfo};
-use crate::machine::{parse_smbios_chassis, MachineInfo};
+use crate::machine::{identify, parse_smbios_chassis, Identity, MachineInfo};
+use crate::memory::{self, Memory};
 
 const CLASS_NAME: &str = "PreventShutdownApp.Blocker";
 const JOB_CLASS_NAME: &str = "PreventShutdownApp.Job";
@@ -75,6 +84,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 static BLOCKING: AtomicBool = AtomicBool::new(false);
+static IDENTITY: OnceLock<Identity> = OnceLock::new();
+static MEMORY_PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+static KNOWN: OnceLock<Option<memory::Known>> = OnceLock::new();
+/// Set once shutdown refusal has been attempted
+static VETOED: AtomicBool = AtomicBool::new(false);
+static NOTED: Mutex<Option<String>> = Mutex::new(None);
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 
 const WM_TRAY: u32 = WM_APP + 1;
@@ -105,6 +120,26 @@ fn play_beep() {
     }
 }
 
+/// Plays the shutting down alert and waits for it to finish
+fn play_shutdown_alert() -> bool {
+    let state = crate::audio::probe();
+    crate::log_line!("alert check at shutdown: {}", state.describe());
+    if !state.can_be_heard() {
+        crate::log_line!("  -> staying silent! An alert here would not be heard");
+        return false;
+    }
+    let wav = crate::sound::beep_wav();
+    let played = unsafe {
+        PlaySoundW(
+            wav.as_ptr().cast(),
+            std::ptr::null_mut(),
+            SND_MEMORY | SND_SYNC | SND_NODEFAULT,
+        )
+    };
+    crate::log_line!("  -> alert played synchronously (PlaySound returned {played})");
+    played != 0
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -126,7 +161,7 @@ pub fn message_box(title: &str, text: &str, error: bool) {
     };
 }
 
-pub fn prepare_process() -> LaunchInfo {
+pub fn prepare_process(host_override: Option<&str>) -> LaunchInfo {
     unsafe {
         SetErrorMode(SEM_FAILCRITICALERRORS);
         SetProcessShutdownParameters(0x3FF, 0);
@@ -145,22 +180,200 @@ pub fn prepare_process() -> LaunchInfo {
     let safe_dir = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     let _ = std::env::set_current_dir(safe_dir);
 
+    let smbios = smbios();
     LaunchInfo {
         removable_exe_drive,
-        machine: machine_info(),
+        machine: machine_info(smbios.as_deref()),
+        identity: Some(identify(
+            smbios.as_deref(),
+            host_override.unwrap_or(&host_name()),
+        )),
     }
 }
 
-fn machine_info() -> MachineInfo {
-    let chassis = unsafe {
-        let size = GetSystemFirmwareTable(RSMB, 0, std::ptr::null_mut(), 0);
-        let mut buf = vec![0u8; size as usize];
-        if size > 0 && GetSystemFirmwareTable(RSMB, 0, buf.as_mut_ptr(), size) == size {
-            parse_smbios_chassis(&buf)
-        } else {
-            None
-        }
+fn host_name() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "UNKNOWN".into())
+}
+
+fn today() -> String {
+    unsafe {
+        let mut st: SYSTEMTIME = std::mem::zeroed();
+        GetLocalTime(&mut st);
+        format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay)
+    }
+}
+
+/// Recorded alongside a machine so a change in its behaviour can be lined up
+fn windows_build() -> Option<String> {
+    let path = wide("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+    let name = wide("CurrentBuildNumber");
+    let mut buf = [0u16; 32];
+    let mut len = std::mem::size_of_val(&buf) as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            path.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+        )
     };
+    if rc != 0 {
+        return None;
+    }
+    let chars = ((len as usize / 2).saturating_sub(1)).min(buf.len());
+    Some(String::from_utf16_lossy(&buf[..chars]))
+}
+
+fn read_memory(path: &std::path::Path) -> Option<Memory> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|text| Memory::parse(&text))
+}
+
+/// Loads what the drive remembers about this PC
+pub fn init_memory(identity: Identity, path: Option<std::path::PathBuf>) -> Option<memory::Known> {
+    crate::log_line!(
+        "machine identity: key={} source={} host={} groups={:?}",
+        identity.key,
+        identity.source,
+        identity.host,
+        identity.prefixes
+    );
+    let known = path
+        .as_ref()
+        .and_then(|p| read_memory(p))
+        .and_then(|m| m.lookup(&identity));
+    match (&path, &known) {
+        (None, _) => crate::log_line!("machine memory: switched off"),
+        (Some(p), None) => {
+            crate::log_line!("machine memory: {} has nothing about this PC", p.display())
+        }
+        (Some(p), Some(k)) => crate::log_line!(
+            "machine memory: {} says state={} ({})",
+            p.display(),
+            k.state,
+            k.describe()
+        ),
+    }
+    IDENTITY.set(identity).ok();
+    MEMORY_PATH.set(path).ok();
+    KNOWN.set(known.clone()).ok();
+    known
+}
+
+pub fn known() -> Option<&'static memory::Known> {
+    KNOWN.get()?.as_ref()
+}
+
+/// True when this PC or another one in the same group overrode the block
+pub fn known_override() -> bool {
+    known().is_some_and(memory::Known::overridden)
+}
+
+/// The full warning, for the window. The tray and the menu get the short form from `status_text` instead, because a tooltip is only 128 characters.
+pub fn memory_warning() -> Option<String> {
+    let k = known().filter(|k| k.overridden())?;
+    Some(format!(
+        "This PC ignores the shutdown block.\n\nWindows overrode it on {}. \
+         Nothing this app can do will stop a shutdown here, so take your drive \
+         with you before you press Shut down.",
+        k.describe()
+    ))
+}
+
+/// Writes down what this PC just did. This runs while Windows is shutting us down, so it opens, writes and closes in one go, the same as the log does
+fn note(state: &str) {
+    if CONFIG.get().is_some_and(|c| c.observe_only) {
+        return;
+    }
+    {
+        let mut noted = lock(&NOTED);
+        if noted.as_deref() == Some(state) {
+            return;
+        }
+        *noted = Some(state.to_string());
+    }
+    let (Some(Some(path)), Some(id)) = (MEMORY_PATH.get(), IDENTITY.get()) else {
+        return;
+    };
+    let mut mem = read_memory(path).unwrap_or_else(Memory::empty);
+    mem.record(id, state, &today(), windows_build().as_deref());
+    match std::fs::write(path, mem.render()) {
+        Ok(()) => crate::log_line!(
+            "machine memory: recorded state={state} for {} in {}",
+            id.host,
+            path.display()
+        ),
+        Err(e) => crate::log_line!("machine memory: couldn't write {}: {e}", path.display()),
+    }
+}
+
+/// Everything the drive remembers, and how this PC matches it. For --memory.
+pub fn memory_report() -> String {
+    let Some(id) = IDENTITY.get() else {
+        return "No machine identity was worked out.".into();
+    };
+    let source = match id.source {
+        "uuid" => "the firmware UUID",
+        "board" => "the baseboard serial",
+        _ => "the computer name only",
+    };
+    let groups = if id.prefixes.is_empty() {
+        "none - this name has no separator to split on".to_string()
+    } else {
+        id.prefixes
+            .iter()
+            .map(|p| format!("{p}*"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = format!(
+        "This PC\n  name:   {}\n  key:    {} (from {source})\n  groups: {groups}\n\n",
+        id.host, id.key
+    );
+    match MEMORY_PATH.get() {
+        Some(Some(path)) => {
+            out.push_str(&format!("Memory file\n  {}\n\n", path.display()));
+            match read_memory(path) {
+                Some(mem) => {
+                    let lines: Vec<String> = mem
+                        .entries()
+                        .map(|e| format!("  {}", e.summary()))
+                        .collect();
+                    out.push_str(&if lines.is_empty() {
+                        "  (no records yet)\n\n".to_string()
+                    } else {
+                        format!("{}\n\n", lines.join("\n"))
+                    });
+                }
+                None => out.push_str("  (not created yet)\n\n"),
+            }
+        }
+        _ => out.push_str("Memory file\n  switched off with --no-memory\n\n"),
+    }
+    match known() {
+        None => out.push_str("Match\n  nothing recorded for this PC or for its groups."),
+        Some(k) => out.push_str(&format!("Match\n  {}\n  state: {}", k.describe(), k.state)),
+    }
+    out
+}
+
+fn smbios() -> Option<Vec<u8>> {
+    unsafe {
+        let size = GetSystemFirmwareTable(RSMB, 0, std::ptr::null_mut(), 0);
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        (GetSystemFirmwareTable(RSMB, 0, buf.as_mut_ptr(), size) == size).then_some(buf)
+    }
+}
+
+fn machine_info(smbios: Option<&[u8]>) -> MachineInfo {
+    let chassis = smbios.and_then(parse_smbios_chassis);
     let role = unsafe { PowerDeterminePlatformRoleEx(POWER_PLATFORM_ROLE_V2) };
     let has_battery = power_status().is_some_and(|p| p.BatteryFlag != 128 && p.BatteryFlag != 255);
     MachineInfo {
@@ -401,10 +614,22 @@ fn sync_once(hwnd: HWND) -> bool {
     if block != was_blocking || (block && reason_changed) {
         unsafe {
             if was_blocking {
-                ShutdownBlockReasonDestroy(hwnd);
+                let ok = ShutdownBlockReasonDestroy(hwnd);
+                crate::log_line!(
+                    "ShutdownBlockReasonDestroy -> {} (GetLastError={})",
+                    ok,
+                    GetLastError()
+                );
             }
             if block {
-                ShutdownBlockReasonCreate(hwnd, wide(&reason).as_ptr());
+                let ok = ShutdownBlockReasonCreate(hwnd, wide(&reason).as_ptr());
+                crate::log_line!(
+                    "ShutdownBlockReasonCreate({:?}) -> {} (GetLastError={}), window visible={}",
+                    reason,
+                    ok,
+                    GetLastError(),
+                    IsWindowVisible(hwnd)
+                );
             }
         }
         *lock(&CURRENT_REASON) = reason;
@@ -415,7 +640,17 @@ fn sync_once(hwnd: HWND) -> bool {
 }
 
 fn status_text() -> String {
-    let base = base_status_text();
+    let mut base = base_status_text();
+    if known_override() {
+        base = format!("THIS PC IGNORES THE BLOCK - take your drive\n{base}");
+    }
+    if CONFIG.get().is_some_and(|c| c.observe_only) {
+        base = format!(
+            "DIAGNOSTIC MODE - NOT blocking anything
+{base}"
+        );
+    }
+    let base = base;
     match lock(&WATCHED_TITLE).as_deref() {
         Some(t) if BLOCKING.load(Ordering::Relaxed) => format!("{base}\nNow: {t}"),
         _ => base,
@@ -579,16 +814,85 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_QUERYENDSESSION => {
+            crate::log_line!(
+                "WM_QUERYENDSESSION received: lparam=0x{:X} [{}], currently blocking={}, \
+                 block reason set={:?}",
+                lparam,
+                crate::log::endsession_flags(lparam),
+                BLOCKING.load(Ordering::Relaxed),
+                lock(&CURRENT_REASON).clone()
+            );
             if lparam & ENDSESSION_CRITICAL != 0 {
+                crate::log_line!(
+                    "  -> ENDSESSION_CRITICAL set, so we return 1 (allow). No application can \
+                     block a critical shutdown; this is our own code standing aside."
+                );
+                if VETOED.load(Ordering::Relaxed) {
+                    note(memory::OVERRIDDEN);
+                }
                 return 1;
             }
-            if sync_block_reason(hwnd) {
+            let block = sync_block_reason(hwnd);
+            if block && CONFIG.get().is_some_and(|c| c.alert) {
+                play_shutdown_alert();
+            }
+            let stall = CONFIG.get().map_or(0, |c| c.stall_ms);
+            if block && stall > 0 {
+                crate::log_line!("  -> stalling for {stall} ms before answering, to test whether Windows treats a slow app differently from one that refuses");
+                std::thread::sleep(std::time::Duration::from_millis(stall as u64));
+                crate::log_line!(
+                    "  -> stall finished; still alive, so Windows did not kill us during it"
+                );
+            }
+            if block && CONFIG.get().is_some_and(|c| c.observe_only) {
+                crate::log_line!(
+                    "  -> returning 1 (OBSERVE-ONLY: we would have vetoed, but this mode consents, so ENDSESSION_CRITICAL appearing anyway means the shutdown was forced from the start, not escalated because we refused)"
+                );
+                return 1;
+            }
+            crate::log_line!(
+                "  -> returning {} ({})",
+                if block { 0 } else { 1 },
+                if block {
+                    "VETO: we told Windows not to shut down. If Windows shuts down anyway, it \
+                     overrode the veto."
+                } else {
+                    "allow: condition not met, nothing to block"
+                }
+            );
+            if block {
+                VETOED.store(true, Ordering::Relaxed);
                 0
             } else {
                 1
             }
         }
-        WM_ENDSESSION => 0,
+        WM_ENDSESSION => {
+            crate::log_line!(
+                "WM_ENDSESSION: session {} (wparam={}), lparam=0x{:X} [{}]. {}",
+                if wparam != 0 {
+                    "IS ending"
+                } else {
+                    "is NOT ending"
+                },
+                wparam,
+                lparam,
+                crate::log::endsession_flags(lparam),
+                if wparam != 0 {
+                    "Windows is proceeding with shutdown despite the above."
+                } else {
+                    "Shutdown was cancelled."
+                }
+            );
+            if VETOED.load(Ordering::Relaxed) {
+                note(if wparam != 0 {
+                    memory::OVERRIDDEN
+                } else {
+                    memory::RESPECTED
+                });
+            }
+            0
+        }
         WM_DEVICECHANGE | WM_POWERBROADCAST => {
             SetTimer(hwnd, SYNC_TIMER_ID, SYNC_DELAY_MS, None);
             1
@@ -635,11 +939,41 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            FillRect(hdc, &rc, GetSysColorBrush(COLOR_WINDOW));
+            let reason = match memory_warning() {
+                Some(warning) => warning,
+                None => lock(&CURRENT_REASON).clone(),
+            };
+            let body = if reason.is_empty() {
+                status_text()
+            } else {
+                format!(
+                    "{reason}
+
+{}",
+                    status_text()
+                )
+            };
+            let text = wide(&body);
+            rc.left += 16;
+            rc.right -= 16;
+            rc.top += 16;
+            DrawTextW(hdc, text.as_ptr(), -1, &mut rc, DT_WORDBREAK | DT_CENTER);
+            EndPaint(hwnd, &ps);
+            0
+        }
         WM_CLOSE => {
+            crate::log_line!("WM_CLOSE received (Windows or the user is asking us to close).");
             DestroyWindow(hwnd);
             0
         }
         WM_DESTROY => {
+            crate::log_line!("WM_DESTROY: shutting ourselves down, block reason released.");
             tray(hwnd, NIM_DELETE);
             WTSUnRegisterSessionNotification(hwnd);
             if BLOCKING.swap(false, Ordering::Relaxed) {
@@ -705,6 +1039,19 @@ pub fn run(config: Config) -> Result<i32, String> {
         if hwnd.is_null() {
             return Err("CreateWindowExW failed".into());
         }
+
+        if CONFIG.get().is_some_and(|c| c.show_window) || known_override() {
+            MoveWindow(hwnd, 80, 80, 480, 170, 0);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        crate::log_line!(
+            "window created: hwnd={:p}, class={}, visible={}, condition={:?}",
+            hwnd,
+            if is_job { JOB_CLASS_NAME } else { CLASS_NAME },
+            IsWindowVisible(hwnd),
+            CONFIG.get().map(|c| c.condition.clone())
+        );
+        crate::log_line!("removable drives seen right now: {:?}", removable_drives());
 
         let taskbar_created = wide("TaskbarCreated");
         TASKBAR_CREATED

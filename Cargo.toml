@@ -1,6 +1,6 @@
 [package]
 name = "prevent-shutdown-app"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Blocks Windows shutdown/sign-out with a custom reason until a condition clears (e.g. a USB drive is unplugged)."
 license = "MIT"
@@ -23,7 +23,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
+    "Win32_System_Com",
     "Win32_System_Power",
+    "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Shutdown",
     "Win32_System_SystemInformation",

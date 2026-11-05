@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use crate::machine::{laptop_check, MachineInfo};
+use crate::machine::{laptop_check, Identity, MachineInfo};
 
 pub const MAX_REASON_UTF16: usize = 255;
 
@@ -48,6 +48,51 @@ pub struct Cli {
     #[arg(long, conflicts_with_all = ["title", "body", "template"])]
     pub stop: bool,
 
+    /// Write a diagnostic log of every shutdown request to PreventShutdownApp.log next to the exe
+    #[arg(long)]
+    pub log: bool,
+
+    /// DIAGNOSTIC: watch and log shutdowns without blocking them. Allows every shutdown, so it protects nothing
+    #[arg(long)]
+    pub observe_only: bool,
+
+    /// Play an alert sound when a shutdown is attempted, for PCs that ignore the block. Only fires if the sound could actually be heard
+    #[arg(long)]
+    pub alert: bool,
+
+    /// Report whether an alert sound could be heard on this PC, then exit
+    #[arg(long, conflicts_with_all = ["title", "body", "template", "stop"])]
+    pub audio_check: bool,
+
+    /// Show what this drive remembers about the PCs it has been used on, then exit
+    #[arg(long, conflicts_with_all = ["title", "body", "template", "stop"])]
+    pub memory: bool,
+
+    /// Don't read or write the record of which PCs ignore the block
+    #[arg(long)]
+    pub no_memory: bool,
+
+    /// Keep that record in this file instead of next to the exe
+    #[arg(long, value_name = "PATH", conflicts_with = "no_memory")]
+    pub memory_file: Option<String>,
+
+    /// DIAGNOSTIC: pretend the computer is called this, to check which remembered
+    /// machines and name prefixes it would match without renaming anything
+    #[arg(long, value_name = "NAME")]
+    pub as_host: Option<String>,
+
+    /// DIAGNOSTIC: show the blocker window instead of keeping it hidden, in case this PC only lists visible windows on its shutdown screen
+    #[arg(long)]
+    pub show_window: bool,
+
+    /// DIAGNOSTIC: wait this many milliseconds before answering Windows' shutdown request (max 60000), to test the unresponsive-app path instead of the veto path
+    #[arg(long, value_name = "MS", default_value_t = 0)]
+    pub stall: u32,
+
+    /// Write the diagnostic log to this file instead (implies --log)
+    #[arg(long, value_name = "PATH")]
+    pub log_file: Option<String>,
+
     /// Extra arguments for the template such as a drive letter
     #[arg(value_name = "ARGS")]
     pub args: Vec<String>,
@@ -83,6 +128,14 @@ pub struct Config {
     pub lock_reminder: bool,
     pub reminder: ReminderText,
     pub show_window_title: bool,
+    /// Log shutdown requests but never veto them. Diagnostic only.
+    pub observe_only: bool,
+    /// Play an alert when a shutdown is attempted, if it could be heard.
+    pub alert: bool,
+    /// Show the blocker window rather than keeping it hidden.
+    pub show_window: bool,
+    /// Milliseconds to wait before answering a shutdown request.
+    pub stall_ms: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +164,8 @@ pub enum Action {
 pub struct LaunchInfo {
     pub removable_exe_drive: Option<char>,
     pub machine: MachineInfo,
+    /// Which PC this is. None only off Windows, and in tests.
+    pub identity: Option<Identity>,
 }
 
 struct Template {
@@ -178,6 +233,10 @@ fn unplug_usb_warning(args: &[String], launch: &LaunchInfo) -> Result<Config, St
         condition,
         lock_reminder: false,
         show_window_title: false,
+        observe_only: false,
+        alert: false,
+        show_window: false,
+        stall_ms: 0,
         reminder: ReminderText {
             menu_label: "Remind me to unplug when computer locks".into(),
             explanation: format!("Whenever you lock the computer while {which} still plugged in, two short beeps will play to remind you to unplug it."),
@@ -201,6 +260,10 @@ fn job_config(display: &str, condition: Condition) -> Config {
         condition,
         lock_reminder: false,
         show_window_title: true,
+        observe_only: false,
+        alert: false,
+        show_window: false,
+        stall_ms: 0,
         reminder: ReminderText {
             menu_label: "Remind me when computer locks".into(),
             explanation: format!("Whenever you lock the computer while {display} is running, two short beeps will play as a reminder."),
@@ -268,6 +331,10 @@ fn take_charger(args: &[String], launch: &LaunchInfo) -> Result<Config, String> 
         condition: Condition::OnAcPower,
         lock_reminder: false,
         show_window_title: false,
+        observe_only: false,
+        alert: false,
+        show_window: false,
+        stall_ms: 0,
         reminder: ReminderText {
             menu_label: "Remind me to take the charger when computer locks".into(),
             explanation: "Whenever you lock the computer while the charger is plugged in, two short beeps will play to remind you to take it.".into(),
@@ -386,6 +453,10 @@ pub fn resolve(cli: Cli, launch: &LaunchInfo) -> Result<Action, String> {
                 condition: Condition::Always,
                 lock_reminder: false,
                 show_window_title: false,
+                observe_only: false,
+                alert: false,
+                show_window: false,
+                stall_ms: 0,
                 reminder: ReminderText::default(),
             }
         }
@@ -397,6 +468,13 @@ pub fn resolve(cli: Cli, launch: &LaunchInfo) -> Result<Action, String> {
 
 fn apply_overrides(config: &mut Config, cli: &Cli) -> Result<(), String> {
     config.lock_reminder = cli.lock_reminder;
+    config.observe_only = cli.observe_only;
+    config.alert = cli.alert;
+    config.show_window = cli.show_window;
+    config.stall_ms = cli.stall;
+    if cli.stall > 60_000 {
+        return Err("--stall must be 60000 ms or less".into());
+    }
     if let Some(title) = &cli.title {
         config.title = title.clone();
     }
